@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Folder proof (TEST, made-up pictures)</title>
+<style>
+body{background:#111;color:#eee;font:15px/1.4 -apple-system,sans-serif;margin:24px}
+button{font:inherit;margin:6px 8px 6px 0;padding:10px 18px;border-radius:8px;border:2px solid #6af;background:#123;color:#eee;cursor:pointer}
+pre{background:#000;padding:10px;white-space:pre-wrap}
+</style></head><body>
+<h1>Folder proof (port 4803)</h1>
+<p id="meta"></p>
+<p>Made-up pictures only. Writes into ONE folder you pick once. It only ever removes files it wrote itself (names listed in its own manifest). Nothing leaves this Mac.</p>
+<button id="setup">1. Set up: pick the folder (once)</button>
+<button id="b1">Save 1</button><button id="b5">Save 5</button><button id="b20">Save 20</button>
+<button id="bfail">Save 5 with a forced failure on the 3rd</button>
+<h2>Log</h2>
+<pre id="log"></pre>
+<script>
+const TOKEN = new URLSearchParams(location.search).get('token') || 'gh-20261116-https';
+document.getElementById('meta').textContent = 'origin ' + location.origin + ', run token ' + TOKEN + ', session ' + (sessionStorage.getItem('s') || (sessionStorage.setItem('s', String(Date.now())), sessionStorage.getItem('s')));
+const log = (m) => { document.getElementById('log').textContent += new Date().toISOString() + ' [' + TOKEN + '] ' + m + '\n'; };
+const hex = async (b) => [...new Uint8Array(await crypto.subtle.digest('SHA-256', await b.arrayBuffer()))].map((x) => x.toString(16).padStart(2, '0')).join('');
+const PREFIX = 'cue-proof-';
+const MANIFEST = 'cue-proof-manifest.json';
+
+// Handle persistence: IndexedDB, one key.
+const idb = () => new Promise((res, rej) => { const r = indexedDB.open('folder-proof', 1); r.onupgradeneeded = () => r.result.createObjectStore('h'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+const putH = async (h) => { const d = await idb(); await new Promise((res, rej) => { const t = d.transaction('h', 'readwrite'); t.objectStore('h').put(h, 'dir'); t.oncomplete = res; t.onerror = () => rej(t.error); }); };
+const getH = async () => { const d = await idb(); return new Promise((res, rej) => { const t = d.transaction('h').objectStore('h').get('dir'); t.onsuccess = () => res(t.result || null); t.onerror = () => rej(t.error); }); };
+
+// Made-up pictures made the same way Cue makes screenshots (canvas.toBlob image/webp 0.8), 1280x720.
+async function makePicture(i) {
+  const c = document.createElement('canvas'); c.width = 1280; c.height = 720;
+  const g = c.getContext('2d');
+  g.fillStyle = 'hsl(' + (i * 37 % 360) + ',60%,30%)'; g.fillRect(0, 0, 1280, 720);
+  g.fillStyle = '#fff'; g.font = 'bold 96px sans-serif'; g.fillText('MADE-UP TEST ' + (i + 1), 80, 380);
+  return new Promise((r) => c.toBlob(r, 'image/webp', 0.8));
+}
+
+document.getElementById('setup').onclick = async () => {
+  try {
+    const h = await window.showDirectoryPicker({ id: 'cue-folder-proof', mode: 'readwrite' });
+    await putH(h);
+    log('SETUP folder picked: ' + h.name + '; permission now ' + await h.queryPermission({ mode: 'readwrite' }));
+  } catch (e) { log('SETUP FAILED: ' + e); }
+};
+
+async function save(n, failAt) {
+  const t0 = performance.now();
+  let h;
+  try { h = await getH(); } catch (e) { log('READ HANDLE FAILED (inconclusive): ' + e); return; }
+  if (!h) { log('NO FOLDER SET UP (inconclusive): press Set up first'); return; }
+  const before = await h.queryPermission({ mode: 'readwrite' });
+  log('SAVE ' + n + ' pressed; permission before press: ' + before + (before === 'granted' ? ' (NO PROMPT needed)' : ' (a PROMPT will be needed)'));
+  if (before !== 'granted') {
+    const after = await h.requestPermission({ mode: 'readwrite' });
+    log('PROMPT answered: ' + after);
+    if (after !== 'granted') { log('SAVE ' + n + ' NOT DONE: permission ' + after + '; nothing marked'); return; }
+  }
+  try {
+    // Remove only files this proof wrote (its own name prefix): the previous batch and any part-batch left by a failure.
+    const old = []; for await (const [k, v] of h.entries()) if (v.kind === 'file' && k.startsWith(PREFIX)) old.push(k);
+    for (const name of old) { try { await h.removeEntry(name); } catch (e) { log('remove ' + name + ' skipped: ' + e); } }
+    const batch = Date.now();
+    const written = [];
+    for (let i = 0; i < n; i++) {
+      if (failAt === i) throw new Error('forced failure before picture ' + (i + 1));
+      const blob = await makePicture(i);
+      const name = PREFIX + batch + '-' + String(i + 1).padStart(2, '0') + '.webp';
+      const fh = await h.getFileHandle(name, { create: true });
+      const w = await fh.createWritable(); await w.write(blob); await w.close();
+      const back = await fh.getFile();
+      const ok = back.size === blob.size && (await hex(back)) === (await hex(blob));
+      written.push({ name, size: blob.size, sha256: await hex(blob), readback_match: ok });
+      if (!ok) throw new Error('read-back mismatch on ' + name);
+    }
+    // Marker last, only after every file closed and read back.
+    const mh = await h.getFileHandle(MANIFEST, { create: true });
+    const mw = await mh.createWritable(); await mw.write(JSON.stringify({ token: TOKEN, batch, files: written.map((x) => x.name), rows: written })); await mw.close();
+    const ms = Math.round(performance.now() - t0);
+    const names = []; for await (const [k] of h.entries()) names.push(k);
+    const onlyNew = names.filter((k) => k.startsWith(PREFIX) && k !== MANIFEST).sort().join() === written.map((x) => x.name).sort().join();
+    log('SAVED ' + n + ' in ' + ms + ' ms; all read-back match: ' + written.every((x) => x.readback_match) + '; folder holds only this batch: ' + onlyNew + '; marked SAVED TO FOLDER');
+  } catch (e) {
+    log('SAVE ' + n + ' FAILED: ' + e + '; NOT marked saved (no manifest written)');
+  }
+}
+document.getElementById('b1').onclick = () => save(1);
+document.getElementById('b5').onclick = () => save(5);
+document.getElementById('b20').onclick = () => save(20);
+document.getElementById('bfail').onclick = () => save(5, 2);
+</script>
+</body></html>
